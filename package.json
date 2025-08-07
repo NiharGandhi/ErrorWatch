@@ -1,0 +1,46 @@
+{
+  "name": "@errorwatchh/sdk",
+  "version": "1.0.0",
+  "description": "ErrorWatch SDK for error monitoring and screen recording",
+  "main": "dist/index.js",
+  "module": "dist/index.esm.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "rollup -c",
+    "dev": "rollup -c -w",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "error-monitoring",
+    "error-tracking",
+    "screen-recording",
+    "debugging",
+    "sentry-alternative"
+  ],
+  "author": "ErrorWatch Team",
+  "license": "MIT",
+  "dependencies": {
+    "rrweb": "^2.0.0-alpha.11",
+    "rrweb-player": "^2.0.0-alpha.11",
+    "tslib": "^2.8.1"
+  },
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^25.0.7",
+    "@rollup/plugin-node-resolve": "^15.2.3",
+    "@rollup/plugin-typescript": "^11.1.5",
+    "rollup": "^4.9.6",
+    "typescript": "^5.3.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/NiharGandhi/sdk"
+  },
+  "bugs": {
+    "url": "https://github.com/NiharGandhi/ErrorWatch/issues"
+  },
+  "homepage": "https://github.com/NiharGandhi/ErrorWatch#readme"
+}
