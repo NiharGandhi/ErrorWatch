@@ -12150,35 +12150,97 @@ var n;
   t2[t2.NotStarted = 0] = "NotStarted", t2[t2.Running = 1] = "Running", t2[t2.Stopped = 2] = "Stopped";
 }(n || (n = {}));
 
+// Check if we're in a browser environment
+const isBrowser = typeof window !== 'undefined' && typeof document !== 'undefined';
+// Key for localStorage queue
+const ERROR_QUEUE_KEY = 'errorwatch_queue_v1';
+const BATCH_INTERVAL = 5000; // ms
+const BATCH_SIZE = 10;
+const BREADCRUMB_LIMIT = 30;
+function loadQueue() {
+    if (!isBrowser)
+        return [];
+    try {
+        const raw = localStorage.getItem(ERROR_QUEUE_KEY);
+        return raw ? JSON.parse(raw) : [];
+    }
+    catch (_a) {
+        return [];
+    }
+}
+function saveQueue(queue) {
+    if (!isBrowser)
+        return;
+    try {
+        localStorage.setItem(ERROR_QUEUE_KEY, JSON.stringify(queue));
+    }
+    catch (_a) { }
+}
+function generateSessionId() {
+    return (Date.now().toString(36) + Math.random().toString(36).slice(2));
+}
 class ErrorWatch {
     constructor(config) {
+        var _a;
         this.isRecording = false;
         this.recordingEvents = [];
+        this.errorQueue = [];
+        this.isSendingQueue = false;
+        this.batch = [];
+        this.batchTimer = null;
+        this.breadcrumbs = [];
+        this.sessionId = '';
+        this.sessionStartTime = 0;
+        const analyticsHooks = { ...config.analyticsHooks };
         this.config = {
             environment: 'production',
-            baseUrl: 'https://jprla2e0--error-ingestion.functions.blink.new',
+            baseUrl: 'http://localhost:8000/errors',
             enableScreenRecording: true,
-            maxRecordingDuration: 30000, // 30 seconds
+            maxRecordingDuration: 30000,
             captureConsole: true,
             captureNetwork: false,
             beforeSend: (error) => error,
-            ...config
+            redactSelectors: [],
+            allowPII: false,
+            analyticsHooks,
+            ...config,
         };
+        this.errorQueue = loadQueue();
+        if (isBrowser) {
+            window.addEventListener('online', () => this.flushQueue());
+        }
+        this.sessionId = generateSessionId();
+        this.sessionStartTime = Date.now();
+        if ((_a = this.config.analyticsHooks) === null || _a === void 0 ? void 0 : _a.onSessionStart) {
+            this.config.analyticsHooks.onSessionStart(this.sessionId);
+        }
+        if (isBrowser) {
+            window.addEventListener('beforeunload', () => {
+                var _a;
+                if ((_a = this.config.analyticsHooks) === null || _a === void 0 ? void 0 : _a.onSessionEnd) {
+                    this.config.analyticsHooks.onSessionEnd(this.sessionId);
+                }
+            });
+        }
         this.init();
     }
     init() {
         // Set up global error handlers
         this.setupErrorHandlers();
-        // Start screen recording if enabled
-        if (this.config.enableScreenRecording) {
+        // Start screen recording if enabled and in browser
+        if (this.config.enableScreenRecording && isBrowser) {
             this.startScreenRecording();
         }
         // Set up console capture if enabled
         if (this.config.captureConsole) {
             this.setupConsoleCapture();
         }
+        this.setupBreadcrumbs();
+        this.flushQueue();
     }
     setupErrorHandlers() {
+        if (!isBrowser)
+            return;
         // Handle uncaught JavaScript errors
         window.addEventListener('error', (event) => {
             var _a;
@@ -12211,6 +12273,8 @@ class ErrorWatch {
         });
     }
     setupConsoleCapture() {
+        if (!isBrowser)
+            return;
         const originalConsoleError = console.error;
         const originalConsoleWarn = console.warn;
         console.error = (...args) => {
@@ -12243,12 +12307,15 @@ class ErrorWatch {
         };
     }
     startScreenRecording() {
-        if (this.isRecording)
+        var _a;
+        if (!isBrowser || this.isRecording)
             return;
         this.recordingEvents = [];
         this.isRecording = true;
         this.stopRecording = record({
             emit: (event) => {
+                // For privacy, recommend using rrweb's maskTextClass option for sensitive fields
+                // Do not mutate rrweb node objects directly
                 this.recordingEvents.push(event);
                 // Limit recording duration
                 if (this.recordingEvents.length > 0) {
@@ -12261,7 +12328,8 @@ class ErrorWatch {
             },
             recordCanvas: true,
             collectFonts: true,
-            plugins: []
+            plugins: [],
+            maskTextClass: ((_a = this.config.redactSelectors) === null || _a === void 0 ? void 0 : _a.join(',')) || undefined,
         });
     }
     restartRecording() {
@@ -12270,7 +12338,72 @@ class ErrorWatch {
         }
         this.startScreenRecording();
     }
+    addBreadcrumb(breadcrumb) {
+        this.breadcrumbs.push(breadcrumb);
+        if (this.breadcrumbs.length > BREADCRUMB_LIMIT) {
+            this.breadcrumbs.shift();
+        }
+    }
+    setupBreadcrumbs() {
+        if (!isBrowser)
+            return;
+        // Navigation
+        window.addEventListener('popstate', () => {
+            this.addBreadcrumb({
+                type: 'navigation',
+                message: 'popstate',
+                data: { url: window.location.href },
+                timestamp: Date.now()
+            });
+        });
+        window.addEventListener('hashchange', () => {
+            this.addBreadcrumb({
+                type: 'navigation',
+                message: 'hashchange',
+                data: { url: window.location.href },
+                timestamp: Date.now()
+            });
+        });
+        // Clicks
+        window.addEventListener('click', (e) => {
+            const target = e.target;
+            this.addBreadcrumb({
+                type: 'ui',
+                message: 'click',
+                data: { tag: target === null || target === void 0 ? void 0 : target.tagName, id: target === null || target === void 0 ? void 0 : target.id, class: target === null || target === void 0 ? void 0 : target.className },
+                timestamp: Date.now()
+            });
+        }, true);
+        // Console
+        const origLog = console.log;
+        console.log = (...args) => {
+            this.addBreadcrumb({
+                type: 'console',
+                message: 'log',
+                data: { args },
+                timestamp: Date.now()
+            });
+            origLog.apply(console, args);
+        };
+    }
+    redactDom(domString) {
+        if (!isBrowser || !this.config.redactSelectors || this.config.allowPII)
+            return domString;
+        let doc = new DOMParser().parseFromString(domString, 'text/html');
+        for (const selector of this.config.redactSelectors) {
+            doc.querySelectorAll(selector).forEach(el => {
+                if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+                    el.value = '[REDACTED]';
+                }
+                else {
+                    el.textContent = '[REDACTED]';
+                }
+            });
+        }
+        return doc.documentElement.outerHTML;
+    }
     async handleError(errorData) {
+        var _a;
         try {
             // Apply beforeSend filter
             const processedError = this.config.beforeSend({
@@ -12282,15 +12415,116 @@ class ErrorWatch {
             // Add screen recording if available
             if (this.config.enableScreenRecording && this.recordingEvents.length > 0) {
                 errorData.screenRecording = JSON.stringify(this.recordingEvents);
+                // Log the screen recording for testing and replay
+                console.log('[ErrorWatch] screenRecording:', errorData.screenRecording);
             }
-            // Send error to ErrorWatch API
-            await this.sendError(errorData);
+            errorData.metadata = {
+                ...errorData.metadata,
+                breadcrumbs: this.breadcrumbs.slice(),
+                sessionId: this.sessionId,
+                userId: this.userId,
+                sessionStart: this.sessionStartTime,
+            };
+            if ((_a = this.config.analyticsHooks) === null || _a === void 0 ? void 0 : _a.onErrorCaptured) {
+                this.config.analyticsHooks.onErrorCaptured(errorData);
+            }
+            this.addToBatch(errorData);
         }
         catch (err) {
-            console.warn('ErrorWatch: Failed to send error', err);
+            this.queueError(errorData);
+            console.warn('ErrorWatch: Failed to queue error for batch', err);
+        }
+    }
+    addToBatch(errorData) {
+        this.batch.push(errorData);
+        if (this.batch.length >= BATCH_SIZE) {
+            this.flushBatch();
+        }
+        else if (!this.batchTimer) {
+            this.batchTimer = setTimeout(() => this.flushBatch(), BATCH_INTERVAL);
+        }
+    }
+    async flushBatch() {
+        if (this.batch.length === 0)
+            return;
+        const batchToSend = this.batch.slice();
+        this.batch = [];
+        if (this.batchTimer) {
+            clearTimeout(this.batchTimer);
+            this.batchTimer = null;
+        }
+        try {
+            await this.sendBatch(batchToSend);
+        }
+        catch (err) {
+            // If batch send fails, queue all errors for retry
+            batchToSend.forEach(e => this.queueError(e));
+            console.warn('ErrorWatch: Failed to send batch, queued for retry', err);
+        }
+    }
+    async sendBatch(errors) {
+        const response = await fetch(this.config.baseUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${this.config.apiKey}`,
+                'X-ErrorWatch-Project': this.config.projectId,
+                'X-ErrorWatch-Batch': '1'
+            },
+            body: JSON.stringify({
+                batch: errors.map(e => {
+                    var _a, _b, _c, _d;
+                    return ({
+                        project_id: this.config.projectId,
+                        message: e.message,
+                        level: e.severity,
+                        environment: this.config.environment,
+                        exception_type: ((_a = e.metadata) === null || _a === void 0 ? void 0 : _a.type) || 'error',
+                        stacktrace: e.stack || '',
+                        user_id: ((_c = (_b = e.metadata) === null || _b === void 0 ? void 0 : _b.user) === null || _c === void 0 ? void 0 : _c.id) || '',
+                        ip_address: '',
+                        sdk: 'errorwatch-js/1.0.0',
+                        breadcrumbs: ((_d = e.metadata) === null || _d === void 0 ? void 0 : _d.breadcrumbs) ? JSON.stringify(e.metadata.breadcrumbs) : '',
+                        timestamp: new Date(e.timestamp).toISOString()
+                    });
+                })
+            })
+        });
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        return response.json();
+    }
+    queueError(errorData) {
+        this.errorQueue.push(errorData);
+        saveQueue(this.errorQueue);
+    }
+    async flushQueue() {
+        if (this.isSendingQueue)
+            return;
+        this.isSendingQueue = true;
+        try {
+            while (this.errorQueue.length > 0) {
+                // Instead of sending one by one, batch up to BATCH_SIZE
+                const batch = this.errorQueue.splice(0, BATCH_SIZE);
+                try {
+                    await this.sendBatch(batch);
+                    saveQueue(this.errorQueue);
+                }
+                catch (_a) {
+                    // If batch fails, put errors back and stop
+                    this.errorQueue = batch.concat(this.errorQueue);
+                    saveQueue(this.errorQueue);
+                    break;
+                }
+            }
+        }
+        finally {
+            this.isSendingQueue = false;
         }
     }
     async sendError(errorData) {
+        var _a, _b, _c, _d;
         const response = await fetch(this.config.baseUrl, {
             method: 'POST',
             headers: {
@@ -12299,9 +12533,17 @@ class ErrorWatch {
                 'X-ErrorWatch-Project': this.config.projectId
             },
             body: JSON.stringify({
-                ...errorData,
+                project_id: this.config.projectId,
+                message: errorData.message,
+                level: errorData.severity,
                 environment: this.config.environment,
-                projectId: this.config.projectId
+                exception_type: ((_a = errorData.metadata) === null || _a === void 0 ? void 0 : _a.type) || 'error',
+                stacktrace: errorData.stack || '',
+                user_id: ((_c = (_b = errorData.metadata) === null || _b === void 0 ? void 0 : _b.user) === null || _c === void 0 ? void 0 : _c.id) || '',
+                ip_address: '',
+                sdk: 'errorwatch-js/1.0.0',
+                breadcrumbs: ((_d = errorData.metadata) === null || _d === void 0 ? void 0 : _d.breadcrumbs) ? JSON.stringify(errorData.metadata.breadcrumbs) : '',
+                timestamp: new Date(errorData.timestamp).toISOString()
             })
         });
         if (!response.ok) {
@@ -12314,8 +12556,8 @@ class ErrorWatch {
         this.handleError({
             message: error.message,
             stack: error.stack,
-            url: window.location.href,
-            userAgent: navigator.userAgent,
+            url: isBrowser ? window.location.href : 'nodejs',
+            userAgent: isBrowser ? navigator.userAgent : 'nodejs',
             timestamp: Date.now(),
             severity: 'error',
             metadata: {
@@ -12327,8 +12569,8 @@ class ErrorWatch {
     captureMessage(message, severity = 'info', metadata) {
         this.handleError({
             message,
-            url: window.location.href,
-            userAgent: navigator.userAgent,
+            url: isBrowser ? window.location.href : 'nodejs',
+            userAgent: isBrowser ? navigator.userAgent : 'nodejs',
             timestamp: Date.now(),
             severity,
             metadata: {
@@ -12340,8 +12582,8 @@ class ErrorWatch {
     captureEvent(eventName, data) {
         this.handleError({
             message: `Event: ${eventName}`,
-            url: window.location.href,
-            userAgent: navigator.userAgent,
+            url: isBrowser ? window.location.href : 'nodejs',
+            userAgent: isBrowser ? navigator.userAgent : 'nodejs',
             timestamp: Date.now(),
             severity: 'info',
             metadata: {
@@ -12352,14 +12594,21 @@ class ErrorWatch {
         });
     }
     setUser(user) {
+        this.userId = user.id;
         // Store user context for future errors
-        this.config.beforeSend = (error) => ({
-            ...error,
-            metadata: {
-                ...error.error.metadata,
-                user
-            }
-        });
+        const originalBeforeSend = this.config.beforeSend;
+        this.config.beforeSend = (error) => {
+            const processed = originalBeforeSend(error);
+            if (!processed)
+                return processed;
+            return {
+                ...processed,
+                metadata: {
+                    ...processed.metadata,
+                    user
+                }
+            };
+        };
     }
     setContext(key, value) {
         const originalBeforeSend = this.config.beforeSend;
@@ -12370,7 +12619,7 @@ class ErrorWatch {
             return {
                 ...processed,
                 metadata: {
-                    ...processed.error.metadata,
+                    ...processed.metadata,
                     [key]: value
                 }
             };
@@ -12382,6 +12631,11 @@ class ErrorWatch {
         }
         this.isRecording = false;
         this.recordingEvents = [];
+        if (this.batchTimer) {
+            clearTimeout(this.batchTimer);
+            this.batchTimer = null;
+        }
+        this.flushBatch();
     }
 }
 // Browser global for script tag usage
